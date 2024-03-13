@@ -2,6 +2,7 @@
 
 import configargparse
 import json
+import os
 import paho.mqtt.client as mqtt
 import pdb
 import requests
@@ -145,12 +146,12 @@ class HomeAssistantMQTT:
     def update_entity(self, device_id, entity_type, entity_id, value):
         mqtt_topic = self.get_mqtt_topic(device_id, entity_type, entity_id)
         logger.debug(f"Sending state update to HomeAssistant: {mqtt_topic}; {value}")
-        self.mqtt.publish(f'{mqtt_topic}/state', payload=value, qos=1)
+        self.mqtt.publish(f'{mqtt_topic}/state', payload=value, qos=1, retain=True)
 
     def remove_entity(self, device_id, entity_type, entity_id):
         mqtt_topic = self.get_mqtt_topic(device_id, entity_type, entity_id)
         logger.debug(f"Removing device: {device_id}/{entity_type}/{entity_id}")
-        self.ha.mqtt.publish(f'{mqtt_topic}/config', payload='', qos=1, retain=True)
+        self.mqtt.publish(f'{mqtt_topic}/config', payload='', qos=1, retain=True)
 
     def mqtt_on_message(self, client, userdata, msg):
         topic_path = msg.topic.split('/')
@@ -164,12 +165,13 @@ class HomeAssistantMQTT:
             self.on_entity_set(topic_path[2], topic_path[3], msg.payload)
 
 class UnipiHomeAssistantBridge:
-    def __init__(self, ha_client, unipi_client):
+    def __init__(self, ha_client, unipi_client, cleanup=False):
         logger.debug("Initializing HA<->UniPi bridge...")
         self.ha = ha_client
         self.ha.on_entity_set = self.set_ha_entity
         self.unipi = unipi_client
-        self.unipi.status_update = self.unipi_status_update
+        self.unipi.status_update = self.update_ha_entity
+        self.cleanup = cleanup
 
         # Raw info from the REST interface
         self.entities = []
@@ -191,6 +193,8 @@ class UnipiHomeAssistantBridge:
         # devices[DEV_TYPE][CIRCUIT]
         self.entities = dict(map(lambda x: (x, {}) ,self.unipi_entity_types))
         self.detect_unipi_entities()
+        if self.cleanup:
+            os._exit(0)
 
     def set_ha_entity(self, device_id, entity_id, value):
         logger.debug(f"Got update from HomeAssistant for {device_id}/{entity_id}: {value}")
@@ -198,21 +202,28 @@ class UnipiHomeAssistantBridge:
         (entity_type, entity_id) = entity_id.split('_', 1)
         self.unipi.update_entity(entity_type, entity_id, value)
 
+    def create_ha_entity(self, unipi_entity):
+        unipi_entity_type = unipi_entity.get('dev')
+        if unipi_entity_type not in self.unipi_entity_types:
+            return
+        ha_entity_type = self.unipi_entity_types[unipi_entity_type]['ha_entity']
+        unipi_entity_id = unipi_entity.get('circuit', 'NONE')
+        ha_entity_id = f'{unipi_entity_type}_{unipi_entity_id}'
+        logger.debug(f"Detected entity: {unipi_entity_type}/{unipi_entity_id} -> {ha_entity_type}/{self.unipi.id}/{ha_entity_id}")
+        self.entities[unipi_entity_type][unipi_entity_id] = unipi_entity
+        if self.cleanup == True:
+            self.ha.remove_entity(self.unipi.id, ha_entity_type, ha_entity_id)
+        else:
+            self.ha.update_entity(self.unipi.id, ha_entity_type, ha_entity_id, unipi_entity.get('value'))
+            self.ha.add_entity(self.unipi.id, ha_entity_type, ha_entity_id, self.unipi_entity_types[unipi_entity_type].get('config', {}))
+
     def detect_unipi_entities(self):
         self.ha.add_device(self.unipi.id, self.unipi.model, self.unipi.serial_number)
-        for entity in self.unipi.entities:
-            unipi_entity_type = entity.get('dev')
-            if unipi_entity_type not in self.unipi_entity_types:
-                continue
-            ha_entity_type = self.unipi_entity_types[unipi_entity_type]['ha_entity']
-            circuit_id = entity.get('circuit', 'NONE')
-            ha_entity_id = f'{entity.get("dev")}_{circuit_id}'
-            logger.debug(f"Detected entity: {unipi_entity_type}/{circuit_id} -> {ha_entity_type}/{self.unipi.id}/{ha_entity_id}")
-            self.entities[unipi_entity_type][circuit_id] = entity
-            self.ha.add_entity(self.unipi.id, ha_entity_type, ha_entity_id, self.unipi_entity_types[unipi_entity_type].get('config', {}))
-            #self.remove_ha_device(device_type, circuit_id)
 
-    def unipi_status_update(self, device_id, entity_type, entity_id, value):
+        for entity in self.unipi.entities:
+            self.create_ha_entity(entity)
+
+    def update_ha_entity(self, device_id, entity_type, entity_id, value):
         if entity_type not in self.unipi_entity_types:
             return
         self.entities[entity_type][entity_id].update({'last_value': value, 'last_update': time.time()})
@@ -228,11 +239,12 @@ if __name__ == "__main__":
     parser.add("-l", "--log-level", default="INFO", choices=["CRITICAL", "INFO", "DEBUG", "TRACE"])
     parser.add("--ha-ip", required=True)
     parser.add("--unipi-ip", required=True)
+    parser.add("--cleanup", action='store_true')
     args = parser.parse_args()
 
     ha = HomeAssistantMQTT(args.ha_ip)
     unipi = UnipiEvok(args.unipi_ip)
-    bridge = UnipiHomeAssistantBridge(ha, unipi)
+    bridge = UnipiHomeAssistantBridge(ha, unipi, args.cleanup)
     while True:
         time.sleep(1)
         #logger.debug("Sleep...")
