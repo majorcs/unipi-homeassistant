@@ -35,8 +35,8 @@ class UnipiEvok(threading.Thread):
         return(json.loads(result.content))
 
     def get_overall_info(self):
-        self.devices = self.get_rest('all')
-        self.device_info = list(filter(lambda x: x.get('dev') in ['neuron'], self.devices))[0]
+        self.entities = self.get_rest('all')
+        self.device_info = list(filter(lambda x: x.get('dev') in ['neuron'], self.entities))[0]
         self.model = self.device_info.get('model', 'Unknown')
         self.serial_number = str(self.device_info.get('sn', 99999))
         self.id = self.model + "-" + self.serial_number
@@ -57,14 +57,20 @@ class HomeAssistantMQTT:
     def __init__(self, ip):
         self.ip = ip        
         self.connect()
+        self.devices = {}
+        self.entities = {}
+        self.on_entity_set = None
         
     def connect(self):
         logger.debug(f"Connecting to MQTT server on ip: {self.ip}")
+        #self.ha_mqtt_prefix = 'TEST'
+        self.ha_mqtt_prefix = 'homeassistant'
+
         self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, clean_session=True)
         #self.mqtt = mqtt.Client(client_id="evok2", clean_session=False)
-        print(self.mqtt)
         self.mqtt.on_subscribe = self.mqtt_subscribe
         self.mqtt.on_connect = self.mqtt_connect
+        self.mqtt.on_message = self.mqtt_on_message
         self.mqtt.connect(self.ip)
         self.mqtt.loop_start()
 
@@ -73,95 +79,110 @@ class HomeAssistantMQTT:
         
     def mqtt_connect(self, client, userdata, connect_flags, reason_code, properties):
         logger.debug(f"MQTT connected {properties}")
-    
-class UnipiHomeAssistantBridge:
-    def __init__(self, ha_client, unipi_client):
-        logger.debug("Initializing HA<->UniPi bridge...")
-        self.ha = ha_client
-        self.ha.mqtt.on_message = self.mqtt_on_message
-        self.unipi = unipi_client
-        self.unipi.ws.on_message = self.ws_on_receive
-        #self.ha_mqtt_prefix = 'TEST'
-        self.ha_mqtt_prefix = 'homeassistant'
 
-        # Raw info from the REST interface
-        self.devices = []
-        self.unipi_device_types = {
-            'input': { 'ha_device': 'binary_sensor', 
-                       'config': { 'payload_on' : '1', 'payload_off' : '0', 'initial_state' : '0' } },
-            'relay': { 'ha_device': 'switch',
-                       'config': { 'payload_on' : '1','payload_off' : '0' } },            
-            'ai':    { 'ha_device': 'sensor',
-                       'config': { 'device_class': 'voltage', 'state_class': 'measurement', 'unit_of_measurement': 'V' } },
-            'ao':    { 'ha_device': 'number',
-                       'config': { 'min' : 0, 'max' : 10, 'step': 0.1, 'device_class': 'voltage', 'state_class': 'measurement', 'unit_of_measurement': 'V' } },            
-            'led':   { 'ha_device': 'switch',
-                       'config': { 'payload_on' : '1', 'payload_off' : '0' } },                        
-            'temp':  { 'ha_device': 'sensor',
-                       'config': { 'device_class': 'temperature', 'state_class': 'measurement', 'unit_of_measurement': '°C' } }
-        }
-        # Parsed device info for lookup in multidimensional dict:
-        # devices[DEV_TYPE][CIRCUIT]
-        self.devices = dict(map(lambda x: (x, {}) ,self.unipi_device_types))
-        self.detect_unipi_devices()
-        listen_topic = self.get_mqtt_topic()
-        logger.debug(f"Subscribing for {listen_topic}")
-        self.ha.mqtt.subscribe(f"{listen_topic}/#")
-    
-    def detect_unipi_devices(self):
-        for dev in self.unipi.devices:
-            device_type = dev.get('dev')
-            circuit_id = dev.get('circuit', 'NONE')
-            if device_type not in self.unipi_device_types:
-                continue
-            logger.debug(f"Detected device: {device_type};{dev.get('circuit')}")
-            self.devices[device_type][circuit_id] = dev
-            self.create_ha_device(device_type, circuit_id, dev.get('value'))
-            #self.remove_ha_device(device_type, circuit_id)
-
-    def get_mqtt_topic(self, devtype=None, id=None):
-        if devtype and id:
-            topic = f"{self.ha_mqtt_prefix}/{self.unipi_device_types[devtype]['ha_device']}/{self.unipi.id}/{devtype}_{id}"
+    def get_mqtt_topic(self, device_id, entity_type=None, entity_id=None):
+        if entity_type and entity_id:
+            topic = f"{self.ha_mqtt_prefix}/{entity_type}/{device_id}/{entity_id}"
         else:
-            topic = f"{self.ha_mqtt_prefix}/+/{self.unipi.id}/+/set"
-        logger.debug(f"Getting topic for {devtype}/{id}: {topic}")
+            topic = f"{self.ha_mqtt_prefix}/+/{device_id}/+/set"
+        logger.debug(f"Getting topic for {device_id}/{entity_type}/{entity_id}: {topic}")
         return(topic)
 
-    def create_ha_device(self, devtype, id, value):
-        mqtt_topic = self.get_mqtt_topic(devtype, id)
-        
-        register_info = {
-            'unique_id': f'{self.unipi.id}_{devtype}_{id}',
-            'name': f'{devtype} {id}',
+    def add_device(self, id, model, serial_number, manufacturer="UniPi"):
+        listen_topic = self.get_mqtt_topic(id)
+        logger.debug(f"Subscribing for {listen_topic}")
+        self.mqtt.subscribe(f"{listen_topic}/#")
+
+        self.devices[id] = {
+            'name': f'{manufacturer} {model}-{serial_number}',
+            'identifiers': [ id ],
+            'manufacturer': manufacturer,
+            'model': model,
+            'serial_number': serial_number
+        }
+
+    def add_entity(self, device_id, entity_type, entity_id, config=None):
+        mqtt_topic = self.get_mqtt_topic(device_id, entity_type, entity_id)
+
+        register_dict = {
+            'unique_id': f'{device_id}_{entity_id}',
+            'name': f'{entity_id}',
             'state_topic': f'{mqtt_topic}/state',
             'command_topic': f'{mqtt_topic}/set',
-            'device': { 'name': f'Unipi {self.unipi.model}-{self.unipi.serial_number}', 'identifiers': [ self.unipi.id ], 'manufacturer': 'UniPi', 'model': self.unipi.model, 'serial_number': self.unipi.serial_number }
+            'device': self.devices.get(device_id, {})
         }
-        if self.unipi_device_types[devtype].get('config'):
-            register_info.update(self.unipi_device_types[devtype]['config'])
-        register_payload = json.dumps(register_info)
-            
-        logger.debug(f"Registering device: {self.unipi.id}_{devtype}_{id}; value: {value}")
-        self.ha.mqtt.publish(f'{mqtt_topic}/config', payload=register_payload, qos=1, retain=True)
-        time.sleep(0.01)
-        self.ha.mqtt.publish(f'{mqtt_topic}/state', payload=value, qos=1)
+        if config is not None:
+            register_dict.update(config)
+        register_payload = json.dumps(register_dict)
+        self.mqtt.publish(f'{mqtt_topic}/config', payload=register_payload, qos=1, retain=True)
 
-    def remove_ha_device(self, devtype, id):
-        mqtt_topic = self.get_mqtt_topic(devtype, id)
-        logger.debug(f"Removing device: {self.unipi.id}_{devtype}_{id}")
+    def remove_entity(self, device_id, entity_type, entity_id):
+        mqtt_topic = self.get_mqtt_topic(device_id, entity_type, entity_id)
+        logger.debug(f"Removing device: {device_id}/{entity_type}/{entity_id}")
         self.ha.mqtt.publish(f'{mqtt_topic}/config', payload='', qos=1, retain=True)
 
     def mqtt_on_message(self, client, userdata, msg):
         topic_path = msg.topic.split('/')
         logger.debug(f"MQTT message received: {msg.topic}:{msg.payload}; {topic_path}")
-        if topic_path[2] != self.unipi.id:
-            logger.debug(f"Uknown UniPi ID received: {topic_path[2]} != {self.unipi.id}")
+        if topic_path[2] not in self.devices:
+            logger.warning(f"This device is not known: {topic_path[2]}")
+            return
         if topic_path[4] != 'set':
             logger.debug(f"Unknown command received: {topic_path[4]}")
-        (dev, circuit) = topic_path[3].split('_', 1)
+        if self.on_entity_set is not None:
+            logger.debug("Calling on_entity_set callback")
+            self.on_entity_set(topic_path[2], topic_path[3], msg.payload)
+
+class UnipiHomeAssistantBridge:
+    def __init__(self, ha_client, unipi_client):
+        logger.debug("Initializing HA<->UniPi bridge...")
+        self.ha = ha_client
+        self.ha.on_entity_set = self.set_ha_entity
+        self.unipi = unipi_client
+        self.unipi.ws.on_message = self.ws_on_receive
+
+        # Raw info from the REST interface
+        self.entities = []
+        self.unipi_entity_types = {
+            'input': { 'ha_entity': 'binary_sensor',
+                       'config': { 'payload_on' : '1', 'payload_off' : '0', 'initial_state' : '0' } },
+            'relay': { 'ha_entity': 'switch',
+                       'config': { 'payload_on' : '1','payload_off' : '0' } },            
+            'ai':    { 'ha_entity': 'sensor',
+                       'config': { 'device_class': 'voltage', 'state_class': 'measurement', 'unit_of_measurement': 'V' } },
+            'ao':    { 'ha_entity': 'number',
+                       'config': { 'min' : 0, 'max' : 10, 'step': 0.1, 'device_class': 'voltage', 'state_class': 'measurement', 'unit_of_measurement': 'V' } },            
+            'led':   { 'ha_entity': 'switch',
+                       'config': { 'payload_on' : '1', 'payload_off' : '0' } },                        
+            'temp':  { 'ha_entity': 'sensor',
+                       'config': { 'device_class': 'temperature', 'state_class': 'measurement', 'unit_of_measurement': '°C' } }
+        }
+        # Parsed device info for lookup in multidimensional dict:
+        # devices[DEV_TYPE][CIRCUIT]
+        self.entities = dict(map(lambda x: (x, {}) ,self.unipi_entity_types))
+        self.detect_unipi_entities()
+
+    def set_ha_entity(self, device_id, entity_id, state):
+        logger.debug(f"Got update from HomeAssistant for {device_id}/{entity_id}: {state}")
+
+        (dev, circuit) = entity_id.split('_', 1)
         
-        payload = { 'cmd': 'set', 'dev': dev, 'circuit': circuit, 'value': float(msg.payload) }
+        payload = { 'cmd': 'set', 'dev': dev, 'circuit': circuit, 'value': float(state) }
         self.unipi.ws.send(json.dumps(payload))
+
+    def detect_unipi_entities(self):
+        self.ha.add_device(self.unipi.id, self.unipi.model, self.unipi.serial_number)
+        for entity in self.unipi.entities:
+            unipi_entity_type = entity.get('dev')
+            if unipi_entity_type not in self.unipi_entity_types:
+                continue
+            ha_entity_type = self.unipi_entity_types[unipi_entity_type]['ha_entity']
+            circuit_id = entity.get('circuit', 'NONE')
+            ha_entity_id = f'{entity.get("dev")}_{circuit_id}'
+            logger.debug(f"Detected entity: {unipi_entity_type}/{circuit_id} -> {ha_entity_type}/{self.unipi.id}/{ha_entity_id}")
+            self.entities[unipi_entity_type][circuit_id] = entity
+            self.ha.add_entity(self.unipi.id, ha_entity_type, ha_entity_id, self.unipi_entity_types[unipi_entity_type].get('config', {}))
+            #self.remove_ha_device(device_type, circuit_id)
 
     def ws_on_receive(self, ws, ws_msg):
         msglist = json.loads(ws_msg)
@@ -172,13 +193,14 @@ class UnipiHomeAssistantBridge:
 
         for msg in msglist:
             devtype = msg.get('dev')
-            if devtype not in self.unipi_device_types:
+            if devtype not in self.unipi_entity_types:
                 continue
             id = msg.get('circuit')
             value = msg.get('value')
             logger.debug(f"Message received: {devtype}/{id}: {value}")
-            self.devices[devtype][id].update({'last_value': value, 'last_update': time.time()})
-            mqtt_topic = self.get_mqtt_topic(devtype, id)
+            self.entities[devtype][id].update({'last_value': value, 'last_update': time.time()})
+            mqtt_topic = self.ha.get_mqtt_topic(self.unipi.id, self.unipi_entity_types[devtype]['ha_entity'], f"{devtype}_{id}")
+            logger.debug(f"Sending state update: {mqtt_topic}; value")
             self.ha.mqtt.publish(f'{mqtt_topic}/state', payload=value, qos=1)
         
 if __name__ == "__main__":
@@ -199,4 +221,4 @@ if __name__ == "__main__":
     #unipi.start()
     while True:
         time.sleep(1)
-        logger.debug("Sleep...")
+        #logger.debug("Sleep...")
