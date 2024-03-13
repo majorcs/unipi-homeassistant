@@ -13,7 +13,7 @@ from websocket import WebSocketApp
 
 
 class UnipiEvok(threading.Thread):
-    def __init__(self, ip, rest_port=8080, rest_ssl=False, status_update_callback=None):
+    def __init__(self, ip, rest_port=8080, rest_ssl=False):
         logger.debug(f"Initializing Unipi EVOK on ip: {ip}")
         super().__init__()
         self.ip = ip
@@ -22,12 +22,14 @@ class UnipiEvok(threading.Thread):
             self.ip + ':' + str(self.rest_port) + '/rest'
         self.connect_ws()
         self.start()
+        self.status_update = None
         
     def connect_ws(self):
         self.get_overall_info()
         self.ws = WebSocketApp(f'ws://{self.ip}/ws', 
             on_error=self.ws_on_error,
-            on_open=self.ws_on_open)
+            on_open=self.ws_on_open,
+            on_message=self.ws_on_message)
 
     def get_rest(self, endpoint):
         logger.debug(f"Getting REST endpoint: '{endpoint}'; REST URL: '{self.rest_url}'")
@@ -51,6 +53,30 @@ class UnipiEvok(threading.Thread):
 
     def ws_on_error(self, ws, error):
         logger.error(f"Websocket error event: {error}")
+
+    def ws_on_message(self, ws, ws_msg):
+        msglist = json.loads(ws_msg)
+
+        ### Temperature messages are coming without an outer list object, apply it to make the message handling the same
+        if isinstance(msglist, dict):
+            msglist = [msglist]
+
+        for msg in msglist:
+            entity_type = msg.get('dev')
+            entity_id = msg.get('circuit')
+            value = msg.get('value')
+            logger.debug(f"UniPi update received: {self.id}/{entity_type}/{entity_id}: {value}")
+            if self.status_update is not None:
+                self.status_update(self.id, entity_type, entity_id, value)
+
+    def update_entity(self, entity_type, entity_id, value):
+        payload = {
+            'cmd': 'set',
+            'dev': entity_type,
+            'circuit': entity_id,
+            'value': float(value)
+        }
+        self.ws.send(json.dumps(payload))
 
 
 class HomeAssistantMQTT:
@@ -85,7 +111,7 @@ class HomeAssistantMQTT:
             topic = f"{self.ha_mqtt_prefix}/{entity_type}/{device_id}/{entity_id}"
         else:
             topic = f"{self.ha_mqtt_prefix}/+/{device_id}/+/set"
-        logger.debug(f"Getting topic for {device_id}/{entity_type}/{entity_id}: {topic}")
+        logger.trace(f"Getting topic for {device_id}/{entity_type}/{entity_id}: {topic}")
         return(topic)
 
     def add_device(self, id, model, serial_number, manufacturer="UniPi"):
@@ -116,6 +142,11 @@ class HomeAssistantMQTT:
         register_payload = json.dumps(register_dict)
         self.mqtt.publish(f'{mqtt_topic}/config', payload=register_payload, qos=1, retain=True)
 
+    def update_entity(self, device_id, entity_type, entity_id, value):
+        mqtt_topic = self.get_mqtt_topic(device_id, entity_type, entity_id)
+        logger.debug(f"Sending state update to HomeAssistant: {mqtt_topic}; {value}")
+        self.mqtt.publish(f'{mqtt_topic}/state', payload=value, qos=1)
+
     def remove_entity(self, device_id, entity_type, entity_id):
         mqtt_topic = self.get_mqtt_topic(device_id, entity_type, entity_id)
         logger.debug(f"Removing device: {device_id}/{entity_type}/{entity_id}")
@@ -130,7 +161,6 @@ class HomeAssistantMQTT:
         if topic_path[4] != 'set':
             logger.debug(f"Unknown command received: {topic_path[4]}")
         if self.on_entity_set is not None:
-            logger.debug("Calling on_entity_set callback")
             self.on_entity_set(topic_path[2], topic_path[3], msg.payload)
 
 class UnipiHomeAssistantBridge:
@@ -139,7 +169,7 @@ class UnipiHomeAssistantBridge:
         self.ha = ha_client
         self.ha.on_entity_set = self.set_ha_entity
         self.unipi = unipi_client
-        self.unipi.ws.on_message = self.ws_on_receive
+        self.unipi.status_update = self.unipi_status_update
 
         # Raw info from the REST interface
         self.entities = []
@@ -162,13 +192,11 @@ class UnipiHomeAssistantBridge:
         self.entities = dict(map(lambda x: (x, {}) ,self.unipi_entity_types))
         self.detect_unipi_entities()
 
-    def set_ha_entity(self, device_id, entity_id, state):
-        logger.debug(f"Got update from HomeAssistant for {device_id}/{entity_id}: {state}")
+    def set_ha_entity(self, device_id, entity_id, value):
+        logger.debug(f"Got update from HomeAssistant for {device_id}/{entity_id}: {value}")
 
-        (dev, circuit) = entity_id.split('_', 1)
-        
-        payload = { 'cmd': 'set', 'dev': dev, 'circuit': circuit, 'value': float(state) }
-        self.unipi.ws.send(json.dumps(payload))
+        (entity_type, entity_id) = entity_id.split('_', 1)
+        self.unipi.update_entity(entity_type, entity_id, value)
 
     def detect_unipi_entities(self):
         self.ha.add_device(self.unipi.id, self.unipi.model, self.unipi.serial_number)
@@ -184,25 +212,13 @@ class UnipiHomeAssistantBridge:
             self.ha.add_entity(self.unipi.id, ha_entity_type, ha_entity_id, self.unipi_entity_types[unipi_entity_type].get('config', {}))
             #self.remove_ha_device(device_type, circuit_id)
 
-    def ws_on_receive(self, ws, ws_msg):
-        msglist = json.loads(ws_msg)
+    def unipi_status_update(self, device_id, entity_type, entity_id, value):
+        if entity_type not in self.unipi_entity_types:
+            return
+        self.entities[entity_type][entity_id].update({'last_value': value, 'last_update': time.time()})
+        self.ha.update_entity(device_id, self.unipi_entity_types[entity_type]['ha_entity'], f'{entity_type}_{entity_id}', value)
 
-        ### Temperature messages are coming without an outer list object, apply it to make the message handling the same
-        if isinstance(msglist, dict):
-            msglist = [msglist]
 
-        for msg in msglist:
-            devtype = msg.get('dev')
-            if devtype not in self.unipi_entity_types:
-                continue
-            id = msg.get('circuit')
-            value = msg.get('value')
-            logger.debug(f"Message received: {devtype}/{id}: {value}")
-            self.entities[devtype][id].update({'last_value': value, 'last_update': time.time()})
-            mqtt_topic = self.ha.get_mqtt_topic(self.unipi.id, self.unipi_entity_types[devtype]['ha_entity'], f"{devtype}_{id}")
-            logger.debug(f"Sending state update: {mqtt_topic}; value")
-            self.ha.mqtt.publish(f'{mqtt_topic}/state', payload=value, qos=1)
-        
 if __name__ == "__main__":
     parser = configargparse.ArgParser(
         description="UniPi <-> HomeAssistant MQTT bridge",
@@ -215,10 +231,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ha = HomeAssistantMQTT(args.ha_ip)
-    #unipi = UnipiEvok('192.168.88.50')
     unipi = UnipiEvok(args.unipi_ip)
     bridge = UnipiHomeAssistantBridge(ha, unipi)
-    #unipi.start()
     while True:
         time.sleep(1)
         #logger.debug("Sleep...")
