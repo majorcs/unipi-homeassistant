@@ -6,6 +6,7 @@ import os
 import paho.mqtt.client as mqtt
 import pdb
 import requests
+import sys
 import threading
 import time
 
@@ -15,7 +16,7 @@ from websocket import WebSocketApp
 
 class UnipiEvok(threading.Thread):
     def __init__(self, ip, rest_port=8080, rest_ssl=False):
-        logger.debug(f"Initializing Unipi EVOK on ip: {ip}")
+        logger.info(f"Initializing Unipi EVOK on ip: {ip}")
         super().__init__()
         self.ip = ip
         self.rest_port = rest_port
@@ -81,20 +82,23 @@ class UnipiEvok(threading.Thread):
 
 
 class HomeAssistantMQTT:
-    def __init__(self, ip):
+    def __init__(self, ip, client_id = None):
         self.ip = ip        
-        self.connect()
+        self.client_id = client_id
         self.devices = {}
         self.entities = {}
+        self.topics = []
+        self.ha_mqtt_prefix = 'homeassistant'
         self.on_entity_set = None
+        self.connect()
         
     def connect(self):
-        logger.debug(f"Connecting to MQTT server on ip: {self.ip}")
-        #self.ha_mqtt_prefix = 'TEST'
-        self.ha_mqtt_prefix = 'homeassistant'
+        logger.info(f"Connecting to MQTT server on ip: {self.ip}")
 
-        self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, clean_session=True)
-        #self.mqtt = mqtt.Client(client_id="evok2", clean_session=False)
+        if self.client_id not in [None, '']:
+            self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.client_id, clean_session=True)
+        else:
+            self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, clean_session=True)
         self.mqtt.on_subscribe = self.mqtt_subscribe
         self.mqtt.on_connect = self.mqtt_connect
         self.mqtt.on_message = self.mqtt_on_message
@@ -102,10 +106,13 @@ class HomeAssistantMQTT:
         self.mqtt.loop_start()
 
     def mqtt_subscribe(self, client, userdata, mid, reason_code_list, properties):
-        logger.debug(f"MQTT subscribe {properties}")
+        logger.debug(f"MQTT subscribe {client};{userdata};{mid};{reason_code_list};{properties}")
         
     def mqtt_connect(self, client, userdata, connect_flags, reason_code, properties):
         logger.debug(f"MQTT connected {properties}")
+        for t in self.topics:
+            logger.info(f"Re-subscribing to: {t}")
+            self.mqtt.subscribe(t)
 
     def get_mqtt_topic(self, device_id, entity_type=None, entity_id=None):
         if entity_type and entity_id:
@@ -116,9 +123,10 @@ class HomeAssistantMQTT:
         return(topic)
 
     def add_device(self, id, model, serial_number, manufacturer="UniPi"):
-        listen_topic = self.get_mqtt_topic(id)
-        logger.debug(f"Subscribing for {listen_topic}")
-        self.mqtt.subscribe(f"{listen_topic}/#")
+        listen_topic = f'{self.get_mqtt_topic(id)}/#'
+        logger.info(f"Subscribing for {listen_topic}")
+        self.mqtt.subscribe(listen_topic)
+        self.topics.append(listen_topic)
 
         self.devices[id] = {
             'name': f'{manufacturer} {model}-{serial_number}',
@@ -166,7 +174,7 @@ class HomeAssistantMQTT:
 
 class UnipiHomeAssistantBridge:
     def __init__(self, ha_client, unipi_clients, cleanup=False):
-        logger.debug("Initializing HA<->UniPi bridge...")
+        logger.info("Initializing HA<->UniPi bridge...")
         self.ha = ha_client
         self.ha.on_entity_set = self.set_ha_entity
         self.unipis = {}
@@ -244,7 +252,10 @@ if __name__ == "__main__":
     parser.add("--cleanup", action='store_true')
     args = parser.parse_args()
 
-    ha = HomeAssistantMQTT(args.ha_ip)
+    logger.remove(0)
+    logger.add(sys.stderr, level=args.log_level)
+
+    ha = HomeAssistantMQTT(args.ha_ip, client_id=f'UniPi2HomeAssistant_{os.urandom(8).hex()}')
     unipi = []
     for ip in args.unipi_ip:
         unipi.append(UnipiEvok(ip))
