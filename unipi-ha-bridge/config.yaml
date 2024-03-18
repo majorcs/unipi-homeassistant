@@ -1,4 +1,4 @@
-name: "UniPi HomeAssistant brodge"
+name: "UniPi HomeAssistant bridge"
 description: "UniPi device and their entities represented in Home Assistant with MQTT auto-discovery"
 version: "0.1.0"
 slug: "unipi_ha"
