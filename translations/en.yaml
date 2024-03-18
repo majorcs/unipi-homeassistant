@@ -1,0 +1,13 @@
+---
+configuration:
+  mqtt:
+    name: IP address for MQTT broker
+    description: >-
+      This option allows you to set the IP address of the MQTT broker
+      user by your Home Assistant instance.
+  unipi:
+    name: IP address list of the UniPi devices
+    description: >-
+      This option allows you to list all IP addresses of your UniPi devices
+      you would like to use from Home Assistant.
+
