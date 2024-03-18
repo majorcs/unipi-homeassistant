@@ -247,7 +247,7 @@ if __name__ == "__main__":
     )
     parser.add("-c", "--config", is_config_file=True, help="config file path")
     parser.add("-l", "--log-level", default="INFO", choices=["CRITICAL", "INFO", "DEBUG", "TRACE"])
-    parser.add("--ha-ip", required=True)
+    parser.add("--mqtt-ip", required=True)
     parser.add("--unipi-ip", required=True, action='append')
     parser.add("--cleanup", action='store_true')
     args = parser.parse_args()
@@ -255,7 +255,7 @@ if __name__ == "__main__":
     logger.remove(0)
     logger.add(sys.stderr, level=args.log_level)
 
-    ha = HomeAssistantMQTT(args.ha_ip, client_id=f'UniPi2HomeAssistant_{os.urandom(8).hex()}')
+    ha = HomeAssistantMQTT(args.mqtt_ip, client_id=f'UniPi2HomeAssistant_{os.urandom(8).hex()}')
     unipi = []
     for ip in args.unipi_ip:
         unipi.append(UnipiEvok(ip))
