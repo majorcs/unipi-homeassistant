@@ -44,7 +44,7 @@ class UnipiEvok(threading.Thread):
         self.model = self.device_info.get('model', 'Unknown')
         self.serial_number = str(self.device_info.get('sn', 99999))
         self.id = self.model + "-" + self.serial_number
-        logger.debug(f"Info collected from device: {self.id}")
+        logger.info(f"UniPi device detected; Model: {self.model}; Serial: {self.serial_number}; ID: {self.id}")
 
     def run(self):
         logger.debug(f"Starting up EVOK websocket server")
